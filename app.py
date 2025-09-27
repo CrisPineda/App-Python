@@ -5,20 +5,12 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
 
 AML_ENDPOINT_URL = os.environ.get("AML_ENDPOINT_URL")
 AML_API_KEY = os.environ.get("AML_API_KEY")
 
 # columnas EXACTAS que espera tu endpoint (en ese orden)
-COLUMNS = [
-    "Pregunta_1",
-    "Pregunta 2",
-    "Pregunta 3",
-    "Pregunta 6",
-    "Pregunta 7",
-    "Sum_Insuf"
-]
+COLUMNS = ["Pregunta_1","Pregunta 2","Pregunta 3","Pregunta 6","Pregunta 7","Sum_Insuf"]
 
 @app.get("/health")
 def health():
@@ -28,88 +20,87 @@ def health():
 @app.post("/predict")
 def predict():
     """
-    Espera JSON como:
+    Espera JSON:
     {
-      "Pregunta_1": 3,
-      "Pregunta_2": 4,        # Nota: en tu CSV es "Pregunta 2" con espacio.
-      "Pregunta_3": 2,        # Para enviar desde frontend, aceptaré ambos formatos.
-      "Pregunta_6": 5,
-      "Pregunta_7": 3,
-      "Sum_Insuf": 17         # opcional: si no viene, se calcula
+      "Pregunta_1": 3, "Pregunta_2": 4, "Pregunta_3": 2,
+      "Pregunta_6": 5, "Pregunta_7": 3,
+      "Sum_Insuf": 17  # opcional, si no viene lo calculo
     }
     """
     if not (AML_ENDPOINT_URL and AML_API_KEY):
         return jsonify({"error": "AML endpoint not configured"}), 500
 
     try:
-        payload_in = request.get_json(force=True)
+        body = request.get_json(force=True) or {}
     except Exception:
         return jsonify({"error": "Body must be JSON"}), 400
 
-    # Normalizo claves para aceptar "Pregunta 2" (espacio) o "Pregunta_2" (guion bajo) desde el frontend
-    normalized = {}
-    for k, v in (payload_in or {}).items():
-        k_norm = k.replace("_", " ")
-        if k_norm.startswith("Pregunta "):
-            normalized[k_norm] = v
-
-    # Mapeo explícito para no depender solo de la normalización
-    def get_num(key_with_space, alt_key_with_underscore):
-        if key_with_space in payload_in:
-            return payload_in[key_with_space]
-        if alt_key_with_underscore in payload_in:
-            return payload_in[alt_key_with_underscore]
-        if key_with_space in normalized:
-            return normalized[key_with_space]
+    def getv(*keys):
+        for k in keys:
+            if k in body: return body[k]
         return None
 
-    p1 = get_num("Pregunta_1", "Pregunta_1")
-    p2 = get_num("Pregunta 2", "Pregunta_2")
-    p3 = get_num("Pregunta 3", "Pregunta_3")
-    p6 = get_num("Pregunta 6", "Pregunta_6")
-    p7 = get_num("Pregunta 7", "Pregunta_7")
+    p1 = getv("Pregunta_1","Pregunta 1")
+    p2 = getv("Pregunta 2","Pregunta_2")
+    p3 = getv("Pregunta 3","Pregunta_3")
+    p6 = getv("Pregunta 6","Pregunta_6")
+    p7 = getv("Pregunta 7","Pregunta_7")
 
-    # Validación básica
-    missing = []
-    for name, val in [("Pregunta_1", p1), ("Pregunta 2", p2), ("Pregunta 3", p3), ("Pregunta 6", p6), ("Pregunta 7", p7)]:
-        if val is None:
-            missing.append(name)
+    missing = [n for n,v in [("Pregunta_1",p1),("Pregunta 2",p2),("Pregunta 3",p3),("Pregunta 6",p6),("Pregunta 7",p7)] if v is None]
     if missing:
-        return jsonify({"error": "Missing fields", "missing": missing}), 400
+        return jsonify({"error":"Missing fields","missing":missing}), 400
 
-    # Sum_Insuf: si no viene, lo calculo
-    sum_in = payload_in.get("Sum_Insuf")
-    if sum_in is None:
+    sum_insuf = body.get("Sum_Insuf")
+    if sum_insuf is None:
         try:
-            sum_in = float(p1) + float(p2) + float(p3) + float(p6) + float(p7)
+            sum_insuf = float(p1)+float(p2)+float(p3)+float(p6)+float(p7)
         except Exception:
-            return jsonify({"error": "Values must be numeric"}), 400
+            return jsonify({"error":"Values must be numeric"}), 400
 
-    # Construyo el payload EXACTO que espera el endpoint de Azure ML
     aml_payload = {
         "input_data": {
             "columns": COLUMNS,
             "index": [0],
-            "data": [[float(p1), float(p2), float(p3), float(p6), float(p7), float(sum_in)]]
+            "data": [[float(p1), float(p2), float(p3), float(p6), float(p7), float(sum_insuf)]]
         }
     }
+    headers = {"Content-Type":"application/json","Authorization":f"Bearer {AML_API_KEY}"}
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {AML_API_KEY}"
-    }
-
+    resp = requests.post(AML_ENDPOINT_URL, data=json.dumps(aml_payload), headers=headers, timeout=30)
     try:
-        resp = requests.post(AML_ENDPOINT_URL, data=json.dumps(aml_payload), headers=headers, timeout=30)
-        try:
-            out = resp.json()
-        except Exception:
-            out = {"raw_text": resp.text}
-        return jsonify({"status_code": resp.status_code, "prediction": out}), resp.status_code
-    except requests.RequestException as e:
-        return jsonify({"error": "Failed calling AML endpoint", "detail": str(e)}), 502
+        out = resp.json()
+    except Exception:
+        out = {"raw": resp.text}
+    return jsonify({"status_code": resp.status_code, "prediction": out}), resp.status_code
 
-# Entry point para gunicorn
+# mini front para probar desde el navegador
+INDEX_HTML = """
+<!doctype html><meta charset="utf-8">
+<h2>Demo Insuficiencia</h2>
+<form id="f">
+  <label>P1 <input name="Pregunta_1" type="number" value="3"></label><br>
+  <label>P2 <input name="Pregunta_2" type="number" value="4"></label><br>
+  <label>P3 <input name="Pregunta_3" type="number" value="2"></label><br>
+  <label>P6 <input name="Pregunta_6" type="number" value="5"></label><br>
+  <label>P7 <input name="Pregunta_7" type="number" value="3"></label><br>
+  <button type="submit">Predecir</button>
+</form>
+<pre id="out"></pre>
+<script>
+document.getElementById('f').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd.entries());
+  // convierte strings a números
+  for (const k in body) body[k] = Number(body[k]);
+  const r = await fetch('/predict', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  document.getElementById('out').textContent = JSON.stringify(await r.json(), null, 2);
+});
+</script>
+"""
+@app.get("/")
+def home():
+    return render_template_string(INDEX_HTML)
+
 if __name__ == "__main__":
-    # Solo para correr local: python app.py
     app.run(host="0.0.0.0", port=8000)
